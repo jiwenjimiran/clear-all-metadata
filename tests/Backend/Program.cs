@@ -7,6 +7,10 @@ using Cove.Data;
 using Cove.Data.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using Cove.Api.Services;
+using Cove.Core.Entities.Galleries.Zip;
+using System.Reflection;
 
 var video = new Video {
     Id = 42, Title = "Wrong scene", Code = "WRONG", Details = "Wrong details", Director = "Wrong director",
@@ -28,12 +32,19 @@ Console.WriteLine("PASS: complete reset, media preservation, repeated reset.");
 
 if (args.Length > 0)
 {
+    if (args.Length < 3) throw new ArgumentException("Pass a disposable PostgreSQL connection string, FFmpeg executable, and a five-second test video.");
+    var testVideoPath = Path.GetFullPath(args[2]);
+    var config = new CoveConfiguration { FfmpegPath = args[1], GeneratedPath = Path.Combine(Path.GetDirectoryName(testVideoPath)!, "generated") };
     var services = new ServiceCollection();
     services.AddLogging();
     services.AddSingleton<IEventBus, EventBus>();
     services.AddCoveData(args[0], runBackgroundMaterializers: false);
     var cleanup = new TestBlobService();
     services.AddSingleton<IBlobService>(cleanup);
+    services.AddSingleton<IThumbnailService>(sp => new ThumbnailService(
+        sp.GetRequiredService<IServiceScopeFactory>(), DispatchProxy.Create<IJobService, UnusedDependency>(), config,
+        DispatchProxy.Create<IZipFileReader, UnusedDependency>(), cleanup, NullLogger<ThumbnailService>.Instance));
+    services.AddScoped<IDefaultCoverGenerator, DefaultCoverGenerator>();
     await using var provider = services.BuildServiceProvider();
     await using var scope = provider.CreateAsyncScope();
     var db = scope.ServiceProvider.GetRequiredService<CoveContext>();
@@ -53,7 +64,7 @@ if (args.Length > 0)
         VideoPerformers = [new() { Performer = new Performer { Name = "Wrong performer" } }],
         Urls = [new() { Url = "https://wrong.example/scene" }],
         RemoteIds = [new() { Endpoint = "https://wrong.example", RemoteId = "wrong" }],
-        Files = [new() { Basename = "keep.mp4", ParentFolder = new Folder { Path = "/media" }, Duration = 120 }]
+        Files = [new() { Basename = Path.GetFileName(testVideoPath), ParentFolder = new Folder { Path = Path.GetDirectoryName(testVideoPath)!.Replace('\\', '/') }, Duration = 5 }]
     };
     db.Videos.Add(identified);
     await db.SaveChangesAsync();
@@ -62,6 +73,11 @@ if (args.Length > 0)
     db.FieldProvenance.Add(new() { HostType = AffinityHostType.Video, HostId = id, FieldKey = "title", SourceKey = "metadata", ValueJson = "\"Incorrect match\"" });
     await db.SaveChangesAsync();
     db.ChangeTracker.Clear();
+    var thumbnails = scope.ServiceProvider.GetRequiredService<IThumbnailService>();
+    if (!await thumbnails.RegenerateVideoThumbnailAsync(id)) throw new Exception("Host baseline default-cover generation failed.");
+    var thumbnailPath = thumbnails.GetThumbnailPathForVideo(id);
+    var expectedCover = await File.ReadAllBytesAsync(thumbnailPath);
+    await File.WriteAllTextAsync(thumbnailPath, "stale-incorrect-cover");
 
     // Reproduce both v0.1.0 failures with the actual production provider/interceptors.
     await using (var transaction = await db.Database.BeginTransactionAsync())
@@ -99,13 +115,33 @@ if (args.Length > 0)
     if (cleared.Title != null || cleared.Details != null || cleared.StudioId != null || cleared.ImageBlobId != null || cleared.Organized || cleared.VideoTags.Count != 0 || cleared.VideoPerformers.Count != 0 || cleared.Urls.Count != 0 || cleared.RemoteIds.Count != 0 || cleared.TagIds.Length != 0 || cleared.PerformerIds.Length != 0)
         throw new Exception("Persisted metadata was not fully cleared.");
     if (await db.TagApplications.AnyAsync() || await db.FieldProvenance.AnyAsync()) throw new Exception("Provenance remains.");
-    if (cleared.Files.Single().Path != "/media/keep.mp4" || cleared.Files.Single().Duration != 120 || !await db.Studios.AnyAsync() || !await db.Performers.AnyAsync() || !await db.Tags.AnyAsync())
+    if (cleared.Files.Single().Path != testVideoPath.Replace('\\', '/') || cleared.Files.Single().Duration != 5 || !await db.Studios.AnyAsync() || !await db.Performers.AnyAsync() || !await db.Tags.AnyAsync())
         throw new Exception("Media or shared entities damaged.");
+    if (!(await File.ReadAllBytesAsync(thumbnailPath)).SequenceEqual(expectedCover))
+        throw new Exception("Reset did not restore exactly the host-generated default cover.");
     if (!cleanup.Deleted.Contains("cover-to-clear")) throw new Exception("Detached cover cleanup was not coordinated.");
     if (!await ClearAllMetadataExtension.ClearAsync(db, coordinator, id)) throw new Exception("Repeated reset failed.");
     if (await ClearAllMetadataExtension.ClearAsync(db, coordinator, int.MaxValue)) throw new Exception("Missing video should return false.");
     Console.WriteLine("PASS: PostgreSQL production retry strategy, blob interceptor, persisted reset, provenance cleanup, media preservation, repeated reset, missing video.");
     Console.WriteLine("PASS: background job authorization, principal restoration, completion summary, and UI update event.");
+    Console.WriteLine("PASS: real host FFmpeg generation replaced a stale cover with the exact default-generated frame.");
+
+    // An unreadable source must fail the job rather than report a restored cover.
+    var file = cleared.Files.Single();
+    db.ChangeTracker.Clear();
+    var missingFile = await db.VideoFiles.SingleAsync(f => f.Id == file.Id);
+    missingFile.Basename = "missing-source.mp4";
+    await db.SaveChangesAsync();
+    var failureNotified = false;
+    using var failureSubscription = scope.ServiceProvider.GetRequiredService<IEventBus>().Subscribe(EventType.VideoUpdated, _ => failureNotified = true);
+    try
+    {
+        await ClearAllMetadataExtension.RunJobAsync(scope.ServiceProvider, CovePrincipal.System(), id, new TestProgress(), CancellationToken.None);
+        throw new Exception("Missing source should fail cover restoration.");
+    }
+    catch (InvalidOperationException ex) when (ex.Message.Contains("default cover could not be generated")) { }
+    if (!failureNotified) throw new Exception("Partial failure did not refresh cleared metadata.");
+    Console.WriteLine("PASS: missing source reports cover-generation failure and still notifies metadata refresh.");
 }
 
 sealed class TestBlobService : IBlobService
@@ -120,4 +156,10 @@ sealed class TestProgress : IJobProgress
 {
     public bool Completed { get; private set; }
     public void Report(double progress, string? subTask = null) { Completed = progress == 1; }
+}
+
+public class UnusedDependency : DispatchProxy
+{
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? arguments)
+        => throw new NotSupportedException($"Unexpected dependency call: {targetMethod?.Name}");
 }
