@@ -1,8 +1,14 @@
 {
   "name": "clear-all-metadata",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node --import ./tests/register.mjs --test tests/frontend.test.mjs" },
-  "devDependencies": { "jsdom": "29.1.1" }
+  "scripts": {
+    "test": "node --import ./tests/register.mjs --test tests/frontend.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "29.1.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  }
 }

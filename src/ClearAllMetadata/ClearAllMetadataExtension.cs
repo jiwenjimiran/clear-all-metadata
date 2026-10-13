@@ -3,6 +3,7 @@ using Cove.Core.Entities;
 using Cove.Core.Events;
 using Cove.Core.Interfaces;
 using System.Security.Claims;
+using System.Text.Json;
 using Cove.Data;
 using Cove.Data.Services;
 using Cove.Plugins;
@@ -15,13 +16,21 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Cove.ClearAllMetadata;
 
-public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiExtension
+public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiExtension, IStatefulExtension
 {
     private IExtensionServiceScopeFactory? _scopes;
     private readonly CancellationTokenSource _shutdown = new();
+    private IExtensionStore? _store;
+    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    public void SetStore(IExtensionStore store) => _store = store;
+    public async Task<ClearSettings> SettingsAsync(CancellationToken ct = default)
+    {
+        var json = await (_store ?? throw new InvalidOperationException("Extension storage is unavailable.")).GetAsync("settings", ct);
+        return json is null ? new() : JsonSerializer.Deserialize<ClearSettings>(json, Json) ?? new();
+    }
     public string Id => "cove.community.clear-all-metadata";
     public string Name => "clear-all-metadata";
-    public string Version => "0.1.3";
+    public string Version => "0.1.4";
     public string? Description => "Clear video identification metadata without rescanning.";
     public string? Author => "jiwenji";
     public string? Url => "https://github.com/jiwenjimiran/clear-all-metadata";
@@ -29,7 +38,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
     public string? MinCoveVersion => "1.5.1";
     public IReadOnlyList<string> Categories => ["video", "tools"];
     public void ConfigureServices(IServiceCollection services, ExtensionContext context)
-        => services.AddScoped<IDefaultCoverGenerator, DefaultCoverGenerator>();
+        => services.AddScoped<IGeneratedAssetCleaner, GeneratedAssetCleaner>();
     public Task InitializeAsync(IServiceProvider services, CancellationToken ct = default)
     {
         _scopes = services.GetRequiredService<IExtensionServiceScopeFactory>();
@@ -38,6 +47,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
     public Task ShutdownAsync(CancellationToken ct = default) => _shutdown.CancelAsync();
     public UIManifest GetUIManifest() => new()
     {
+        SettingsPanels = [new($"{Id}:settings", "Clear all metadata", Id, "ClearMetadataSettings", Order: 270, TargetTab: "extensions")],
         Actions = [new("clear-all-metadata", "Clear all metadata", Id, "toolbar", ["video"],
             Icon: "eraser", HandlerName: "clearMetadata", Order: 999, SuppressSuccessAlert: true)
             { RequiredPermission = Permissions.VideosWrite },
@@ -48,6 +58,13 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
 
     public void MapEndpoints(IEndpointRouteBuilder endpoints)
     {
+        endpoints.MapGet("/api/ext/clear-all-metadata/settings", async (CancellationToken ct) => Results.Json(await SettingsAsync(ct), Json))
+            .RequireCovePermission(Permissions.JobsRun);
+        endpoints.MapPut("/api/ext/clear-all-metadata/settings", async (ClearSettings settings, CancellationToken ct) =>
+        {
+            await (_store ?? throw new InvalidOperationException("Extension storage is unavailable.")).SetAsync("settings", JsonSerializer.Serialize(settings, Json), ct);
+            return Results.Json(settings, Json);
+        }).RequireCovePermission(Permissions.SystemSettingsWrite);
         endpoints.MapPost("/api/ext/clear-all-metadata/clear", async (ClearRequest request, HttpContext http, CancellationToken ct) =>
         {
             int[] ids;
@@ -69,13 +86,16 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
             if (await db.Videos.CountAsync(v => ids.Contains(v.Id), ct) != ids.Length)
                 return Results.NotFound(new { message = "One or more selected videos no longer exist." });
             var owner = Snapshot(principal);
+            var settings = request.Settings ?? await SettingsAsync(ct);
+            if ((settings.Phash || settings.Md5) && !principal.Has(Permissions.FilesWrite))
+                return Results.Json(new { message = "Clearing file fingerprints requires files.write permission." }, statusCode: 403);
             var scopes = _scopes ?? throw new InvalidOperationException("Extension is not initialized.");
             var shutdown = _shutdown.Token;
             var jobId = services.GetRequiredService<IJobService>().EnqueueFor(JobOwner.FromPrincipal(owner),
                 $"ext:{Id}:clear", ids.Length == 1 ? $"Clear all metadata for video #{ids[0]}" : $"Clear all metadata for {ids.Length} videos", async (progress, jobCt) =>
                 {
                     using var linked = CancellationTokenSource.CreateLinkedTokenSource(jobCt, shutdown);
-                    await RunBatchAsync(scopes, owner, ids, progress, linked.Token);
+                    await RunBatchAsync(scopes, owner, ids, progress, linked.Token, settings);
                 }, resultUrl: ids.Length == 1 ? $"/video/{ids[0]}" : "/videos");
             return Results.Accepted(value: new { jobId, suppressToast = true });
         }).RequireCovePermission(Permissions.VideosWrite);
@@ -88,7 +108,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
         return ids.Distinct().ToArray();
     }
 
-    public static async Task RunBatchAsync(IExtensionServiceScopeFactory scopes, CovePrincipal principal, int[] ids, Cove.Core.Interfaces.IJobProgress progress, CancellationToken ct)
+    public static async Task RunBatchAsync(IExtensionServiceScopeFactory scopes, CovePrincipal principal, int[] ids, Cove.Core.Interfaces.IJobProgress progress, CancellationToken ct, ClearSettings? settings = null)
     {
         ids = SelectionIds(ids);
         progress.DeclareUnits(ids.Select(id => (id.ToString(), (string?)$"Video #{id}")));
@@ -102,8 +122,8 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
             try
             {
                 await using var scope = scopes.CreateAsyncScope();
-                await RunJobAsync(scope.ServiceProvider, principal, id, new UnitProgress(unit, progress, index, ids.Length), ct);
-                unit.Complete(JobUnitOutcome.Succeeded, "Metadata cleared and default cover regenerated");
+                await RunJobAsync(scope.ServiceProvider, principal, id, new UnitProgress(unit, progress, index, ids.Length), ct, settings);
+                unit.Complete(JobUnitOutcome.Succeeded, "Selected fields cleared");
                 succeeded++;
             }
             catch (OperationCanceledException) { throw; }
@@ -114,7 +134,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
             }
             progress.Report((double)(index + 1) / ids.Length, $"Processed {index + 1}/{ids.Length} videos");
         }
-        progress.SetSummary($"{succeeded} videos cleared with default covers regenerated; {failed} failed.");
+        progress.SetSummary($"{succeeded} videos cleared; {failed} failed.");
         if (failed > 0) throw new InvalidOperationException($"{failed} videos failed. See per-video job details; successful resets were retained.");
     }
 
@@ -128,7 +148,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
         public void SetSummary(string summary) => Report(1, summary);
     }
 
-    public static async Task RunJobAsync(IServiceProvider services, CovePrincipal principal, int id, Cove.Core.Interfaces.IJobProgress progress, CancellationToken ct)
+    public static async Task RunJobAsync(IServiceProvider services, CovePrincipal principal, int id, Cove.Core.Interfaces.IJobProgress progress, CancellationToken ct, ClearSettings? settings = null)
     {
         var accessor = services.GetRequiredService<ICurrentPrincipalAccessor>();
         var previous = accessor.Current;
@@ -141,21 +161,17 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
                 var decision = await auth.AuthorizeAsync(principal, permission, EntityRef.Of("video", id), ct);
                 if (!decision.Allowed) throw new UnauthorizedAccessException(decision.Reason ?? $"Missing {permission}.");
             }
-            progress.Report(0, "Clearing identification metadata");
-            if (!await ClearAsync(services.GetRequiredService<CoveContext>(), services.GetRequiredService<BlobReferenceTransactionCoordinator>(), id, ct))
+            settings ??= new();
+            if ((settings.Phash || settings.Md5) && !principal.Has(Permissions.FilesWrite))
+                throw new UnauthorizedAccessException("Clearing file fingerprints requires files.write permission.");
+            progress.Report(0, "Clearing selected fields");
+            if (!await ClearAsync(services.GetRequiredService<CoveContext>(), services.GetRequiredService<BlobReferenceTransactionCoordinator>(), id, ct, settings))
                 throw new InvalidOperationException("Video no longer exists.");
             try
             {
-                progress.Report(0.5, "Regenerating default cover");
-                if (!await services.GetRequiredService<IDefaultCoverGenerator>().GenerateAsync(id, ct))
-                    throw new InvalidOperationException("Metadata cleared, but the default cover could not be generated. Check that the primary video file is readable and FFmpeg is available.");
-                // Refresh the cover URL after the generated file has actually changed.
-                var db = services.GetRequiredService<CoveContext>();
-                db.ChangeTracker.Clear();
-                var video = await db.Videos.SingleAsync(v => v.Id == id, ct);
-                video.UpdatedAt = DateTime.UtcNow;
-                await db.SaveChangesAsync(ct);
-                progress.SetSummary($"All identification metadata cleared and default cover regenerated for video #{id}.");
+                progress.Report(0.5, "Clearing selected generated assets");
+                await services.GetRequiredService<IGeneratedAssetCleaner>().ClearAsync(id, settings, ct);
+                progress.SetSummary($"Selected fields cleared for video #{id}.");
             }
             finally
             {
@@ -174,7 +190,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
         ClaimsPrincipal = p.ClaimsPrincipal is null ? null : new ClaimsPrincipal(p.ClaimsPrincipal), TokenId = p.TokenId, Ip = p.Ip, UserAgent = p.UserAgent
     };
 
-    public static Task<bool> ClearAsync(CoveContext db, BlobReferenceTransactionCoordinator blobs, int id, CancellationToken ct = default)
+    public static Task<bool> ClearAsync(CoveContext db, BlobReferenceTransactionCoordinator blobs, int id, CancellationToken ct = default, ClearSettings? settings = null)
         => db.Database.CreateExecutionStrategy().ExecuteAsync(async () =>
         {
             // Re-read on retries so a rolled-back attempt never leaves stale tracked entities.
@@ -185,32 +201,42 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
                 .Include(v => v.VideoTags).Include(v => v.VideoPerformers)
                 .FirstOrDefaultAsync(v => v.Id == id, ct);
             if (video is null) return false;
-            Reset(video);
-            db.TagApplications.RemoveRange(await db.TagApplications
+            settings ??= new();
+            Reset(video, settings);
+            if (settings.Tags) db.TagApplications.RemoveRange(await db.TagApplications
                 .Where(p => p.HostType == AffinityHostType.Video && p.HostId == id).ToListAsync(ct));
+            var keys = settings.ProvenanceKeys();
             db.FieldProvenance.RemoveRange(await db.FieldProvenance
-                .Where(p => p.HostType == AffinityHostType.Video && p.HostId == id).ToListAsync(ct));
+                .Where(p => p.HostType == AffinityHostType.Video && p.HostId == id && keys.Contains(p.FieldKey)).ToListAsync(ct));
+            if (settings.Phash || settings.Md5)
+            {
+                var fileIds = db.VideoFiles.Where(f => f.VideoId == id).Select(f => f.Id);
+                db.FileFingerprints.RemoveRange(await db.FileFingerprints.Where(f => fileIds.Contains(f.FileId)
+                    && ((settings.Phash && f.Type == "phash") || (settings.Md5 && f.Type == "md5"))).ToListAsync(ct));
+            }
             await db.SaveChangesAsync(ct);
             await transaction.CommitAsync(ct);
             await blobTransaction.CompleteAsync();
             return true;
         });
 
-    public static void Reset(Video video)
+    public static void Reset(Video video, ClearSettings? settings = null)
     {
-        video.Title = video.Code = video.Details = video.Director = null;
-        video.Date = null;
-        video.DatePrecision = default;
-        video.StudioId = null;
-        video.Studio = null;
-        video.ImageBlobId = null;
-        video.Organized = false;
-        video.Urls.Clear();
-        video.RemoteIds.Clear();
-        video.VideoTags.Clear();
-        video.VideoPerformers.Clear();
+        settings ??= new();
+        if (settings.Title) video.Title = null;
+        if (settings.Code) video.Code = null;
+        if (settings.Details) video.Details = null;
+        if (settings.Director) video.Director = null;
+        if (settings.Date) { video.Date = null; video.DatePrecision = default; }
+        if (settings.Studio) { video.StudioId = null; video.Studio = null; }
+        if (settings.Cover) video.ImageBlobId = null;
+        if (settings.Organized) video.Organized = false;
+        if (settings.Urls) video.Urls.Clear();
+        if (settings.RemoteIds) video.RemoteIds.Clear();
+        if (settings.Tags) video.VideoTags.Clear();
+        if (settings.Performers) video.VideoPerformers.Clear();
         video.UpdatedAt = DateTime.UtcNow;
     }
 }
 
-public sealed record ClearRequest(int[]? EntityIds);
+public sealed record ClearRequest(int[]? EntityIds, ClearSettings? Settings = null);
