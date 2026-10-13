@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <EnableDynamicLoading>true</EnableDynamicLoading>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <CoveSourceRoot Condition="'$(CoveSourceRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\cove</CoveSourceRoot>
   </PropertyGroup>
   <ItemGroup>
@@ -16,3 +16,4 @@
     <None Include="../../frontend/*.mjs" Link="assets/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Always" />
   </ItemGroup>
 </Project>
+

@@ -26,19 +26,17 @@ test('lifecycle handles menus opening later and disconnects on unload', async ()
   dom.window.close();
 });
 
-test('cancellation and invalid selection never mutate; success sends one video ID; failures propagate', async () => {
+test('invalid selection never queues; valid selection queues without popups; failures propagate', async () => {
   let calls = 0;
-  globalThis.window = { confirm: () => false };
+  globalThis.window = { confirm: () => { throw new Error('Unexpected popup'); }, alert: () => { throw new Error('Unexpected popup'); } };
   globalThis.fetch = async (_url, options) => {
     calls++;
     assert.deepEqual(JSON.parse(options.body), { entityIds: [42] });
-    return { ok: true, json: async () => ({ message: 'Cleared' }) };
+    return { ok: true, json: async () => ({ jobId: 'queued-job' }) };
   };
-  assert.deepEqual(await clearMetadata(null, { entityIds: [42] }), { cancelled: true });
   await assert.rejects(clearMetadata(null, { entityIds: [42, 43] }), /exactly one/);
   assert.equal(calls, 0);
-  window.confirm = () => true;
-  assert.equal((await clearMetadata(null, { entityIds: [42] })).message, 'Cleared');
+  assert.deepEqual(await clearMetadata(null, { entityIds: [42] }), { jobId: 'queued-job', suppressToast: true });
   assert.equal(calls, 1);
   globalThis.fetch = async () => ({ ok: false, status: 403, json: async () => ({ message: 'Forbidden' }) });
   await assert.rejects(clearMetadata(null, { entityIds: [42] }), /Forbidden/);

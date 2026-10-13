@@ -4,15 +4,13 @@ export async function clearMetadata(_action, payload) {
   const ids = payload?.entityIds;
   if (!Array.isArray(ids) || ids.length !== 1 || !Number.isInteger(ids[0]) || ids[0] <= 0)
     throw new Error('Select exactly one video.');
-  if (!window.confirm('Clear all metadata for this video?\n\nThis removes title, code, details, director, date, studio, performers, tags, URLs, remote IDs, cover art, organized status, and metadata provenance, including manual edits to these fields.\n\nThe video and its files stay in your library.'))
-    return { cancelled: true };
   const response = await extensionFetch('/api/ext/clear-all-metadata/clear', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ entityIds: ids }),
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(result.message || result.detail || `Cove returned ${response.status}.`);
-  return result;
+  return { ...result, suppressToast: true };
 }
 
 // Cove currently has no action section declaration. Reorder only our own native
