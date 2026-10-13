@@ -21,7 +21,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
     private readonly CancellationTokenSource _shutdown = new();
     public string Id => "cove.community.clear-all-metadata";
     public string Name => "clear-all-metadata";
-    public string Version => "0.1.2";
+    public string Version => "0.1.3";
     public string? Description => "Clear video identification metadata without rescanning.";
     public string? Author => "jiwenji";
     public string? Url => "https://github.com/jiwenjimiran/clear-all-metadata";
@@ -40,6 +40,9 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
     {
         Actions = [new("clear-all-metadata", "Clear all metadata", Id, "toolbar", ["video"],
             Icon: "eraser", HandlerName: "clearMetadata", Order: 999, SuppressSuccessAlert: true)
+            { RequiredPermission = Permissions.VideosWrite },
+            new("clear-all-metadata-selected", "Clear all metadata", Id, "bulk", ["video", "videos"],
+            Icon: "eraser", HandlerName: "clearMetadata", Order: 999, SuppressSuccessAlert: true)
             { RequiredPermission = Permissions.VideosWrite }]
     };
 
@@ -47,36 +50,82 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
     {
         endpoints.MapPost("/api/ext/clear-all-metadata/clear", async (ClearRequest request, HttpContext http, CancellationToken ct) =>
         {
-            var ids = request.EntityIds;
-            if (ids is not { Length: 1 } || ids[0] <= 0)
-                return Results.BadRequest(new { message = "Select exactly one video." });
+            int[] ids;
+            try { ids = SelectionIds(request.EntityIds); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { message = ex.Message }); }
             var services = http.RequestServices;
             var principal = services.GetRequiredService<ICurrentPrincipalAccessor>().Current;
             if (principal is null) return Results.Unauthorized();
             var auth = services.GetRequiredService<IAuthorizationService>();
             if (!principal.Has(Permissions.JobsRun))
                 return Results.Json(new { message = "Missing jobs.run permission." }, statusCode: 403);
+            foreach (var id in ids)
             foreach (var permission in new[] { Permissions.VideosRead, Permissions.VideosWrite })
             {
-                var decision = await auth.AuthorizeAsync(principal, permission, EntityRef.Of("video", ids[0]), ct);
+                var decision = await auth.AuthorizeAsync(principal, permission, EntityRef.Of("video", id), ct);
                 if (!decision.Allowed) return Results.Json(new { message = decision.Reason }, statusCode: 403);
             }
             var db = services.GetRequiredService<CoveContext>();
-            var id = ids[0];
-            if (!await db.Videos.AnyAsync(v => v.Id == id, ct))
-                return Results.NotFound(new { message = "Video no longer exists." });
+            if (await db.Videos.CountAsync(v => ids.Contains(v.Id), ct) != ids.Length)
+                return Results.NotFound(new { message = "One or more selected videos no longer exist." });
             var owner = Snapshot(principal);
             var scopes = _scopes ?? throw new InvalidOperationException("Extension is not initialized.");
             var shutdown = _shutdown.Token;
             var jobId = services.GetRequiredService<IJobService>().EnqueueFor(JobOwner.FromPrincipal(owner),
-                $"ext:{Id}:clear", $"Clear all metadata for video #{id}", async (progress, jobCt) =>
+                $"ext:{Id}:clear", ids.Length == 1 ? $"Clear all metadata for video #{ids[0]}" : $"Clear all metadata for {ids.Length} videos", async (progress, jobCt) =>
                 {
                     using var linked = CancellationTokenSource.CreateLinkedTokenSource(jobCt, shutdown);
-                    await using var scope = scopes.CreateAsyncScope();
-                    await RunJobAsync(scope.ServiceProvider, owner, id, progress, linked.Token);
-                }, resultUrl: $"/video/{id}");
+                    await RunBatchAsync(scopes, owner, ids, progress, linked.Token);
+                }, resultUrl: ids.Length == 1 ? $"/video/{ids[0]}" : "/videos");
             return Results.Accepted(value: new { jobId, suppressToast = true });
         }).RequireCovePermission(Permissions.VideosWrite);
+    }
+
+    public static int[] SelectionIds(int[]? ids)
+    {
+        if (ids is null || ids.Length == 0 || ids.Length > 10000 || ids.Any(id => id <= 0))
+            throw new ArgumentException("Select between 1 and 10000 videos with positive IDs.");
+        return ids.Distinct().ToArray();
+    }
+
+    public static async Task RunBatchAsync(IExtensionServiceScopeFactory scopes, CovePrincipal principal, int[] ids, Cove.Core.Interfaces.IJobProgress progress, CancellationToken ct)
+    {
+        ids = SelectionIds(ids);
+        progress.DeclareUnits(ids.Select(id => (id.ToString(), (string?)$"Video #{id}")));
+        var succeeded = 0;
+        var failed = 0;
+        for (var index = 0; index < ids.Length; index++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var id = ids[index];
+            using var unit = progress.StartUnit(id.ToString(), $"Video #{id}");
+            try
+            {
+                await using var scope = scopes.CreateAsyncScope();
+                await RunJobAsync(scope.ServiceProvider, principal, id, new UnitProgress(unit, progress, index, ids.Length), ct);
+                unit.Complete(JobUnitOutcome.Succeeded, "Metadata cleared and default cover regenerated");
+                succeeded++;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                unit.Complete(JobUnitOutcome.Failed, ex.Message);
+                failed++;
+            }
+            progress.Report((double)(index + 1) / ids.Length, $"Processed {index + 1}/{ids.Length} videos");
+        }
+        progress.SetSummary($"{succeeded} videos cleared with default covers regenerated; {failed} failed.");
+        if (failed > 0) throw new InvalidOperationException($"{failed} videos failed. See per-video job details; successful resets were retained.");
+    }
+
+    private sealed class UnitProgress(Cove.Core.Interfaces.IJobUnit unit, Cove.Core.Interfaces.IJobProgress overall, int index, int count) : Cove.Core.Interfaces.IJobProgress
+    {
+        public void Report(double value, string? message = null)
+        {
+            unit.Report(value, message);
+            overall.Report((index + value) / count, message);
+        }
+        public void SetSummary(string summary) => Report(1, summary);
     }
 
     public static async Task RunJobAsync(IServiceProvider services, CovePrincipal principal, int id, Cove.Core.Interfaces.IJobProgress progress, CancellationToken ct)

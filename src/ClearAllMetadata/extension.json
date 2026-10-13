@@ -1,7 +1,7 @@
 {
   "id": "cove.community.clear-all-metadata",
   "name": "clear-all-metadata",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Clear video identification metadata without deleting or rescanning media.",
   "author": "jiwenji",
   "url": "https://github.com/jiwenjimiran/clear-all-metadata",

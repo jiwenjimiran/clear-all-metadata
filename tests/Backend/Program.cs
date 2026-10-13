@@ -11,6 +11,9 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Cove.Api.Services;
 using Cove.Core.Entities.Galleries.Zip;
 using System.Reflection;
+using Cove.Plugins;
+using HostProgress = Cove.Core.Interfaces.IJobProgress;
+using HostUnit = Cove.Core.Interfaces.IJobUnit;
 
 var video = new Video {
     Id = 42, Title = "Wrong scene", Code = "WRONG", Details = "Wrong details", Director = "Wrong director",
@@ -29,6 +32,15 @@ if (video.Id != 42 || video.PrimaryFileId != 9 || video.Files.Single().Id != 9 |
     throw new Exception("Reset damaged preserved media or user data.");
 ClearAllMetadataExtension.Reset(video);
 Console.WriteLine("PASS: complete reset, media preservation, repeated reset.");
+if (!ClearAllMetadataExtension.SelectionIds([42, 43, 42]).SequenceEqual(new[] { 42, 43 })) throw new Exception("Selection was not deduplicated.");
+foreach (var invalid in new int[]?[] { null, [], [0], [-1], new int[10001] })
+{
+    try { ClearAllMetadataExtension.SelectionIds(invalid); throw new Exception("Invalid selection accepted."); }
+    catch (ArgumentException) { }
+}
+var actions = new ClearAllMetadataExtension().GetUIManifest().Actions;
+if (!actions.Any(a => a.ActionType == "bulk" && a.Icon == "eraser" && a.SuppressSuccessAlert) || !actions.Any(a => a.ActionType == "toolbar"))
+    throw new Exception("Single and bulk actions must both be declared.");
 
 if (args.Length > 0)
 {
@@ -142,6 +154,61 @@ if (args.Length > 0)
     catch (InvalidOperationException ex) when (ex.Message.Contains("default cover could not be generated")) { }
     if (!failureNotified) throw new Exception("Partial failure did not refresh cleared metadata.");
     Console.WriteLine("PASS: missing source reports cover-generation failure and still notifies metadata refresh.");
+
+    async Task<int> AddBatchVideo(string label, bool readable)
+    {
+        db.ChangeTracker.Clear();
+        var directory = Path.Combine(Path.GetDirectoryName(testVideoPath)!, label);
+        Directory.CreateDirectory(directory);
+        if (readable) File.Copy(testVideoPath, Path.Combine(directory, "source.mp4"), true);
+        var item = new Video { Title = label, Details = "Wrong metadata", Organized = true,
+            Files = [new() { Basename = "source.mp4", ParentFolder = new Folder { Path = directory.Replace('\\', '/') }, Duration = 5 }] };
+        db.Videos.Add(item);
+        await db.SaveChangesAsync();
+        return item.Id;
+    }
+    var first = await AddBatchVideo("bulk-first", true);
+    var broken = await AddBatchVideo("bulk-broken", false);
+    var last = await AddBatchVideo("bulk-last", true);
+    var untouched = await AddBatchVideo("unselected", true);
+    var batchProgress = new TestProgress();
+    var scopes = new TestScopeFactory(provider.GetRequiredService<IServiceScopeFactory>());
+    try
+    {
+        await ClearAllMetadataExtension.RunBatchAsync(scopes, CovePrincipal.System(), [first, broken, last, first], batchProgress, CancellationToken.None);
+        throw new Exception("Mixed failure batch should report failure.");
+    }
+    catch (InvalidOperationException ex) when (ex.Message.Contains("1 videos failed")) { }
+    if (batchProgress.Units.Count != 3 || batchProgress.Units.Count(u => u.Outcome == JobUnitOutcome.Succeeded) != 2 || batchProgress.Units.Count(u => u.Outcome == JobUnitOutcome.Failed) != 1 || batchProgress.Summary != "2 videos cleared with default covers regenerated; 1 failed.")
+        throw new Exception("Batch counts or summary are wrong.");
+    db.ChangeTracker.Clear();
+    if (await db.Videos.Where(v => new[] { first, broken, last }.Contains(v.Id)).AnyAsync(v => v.Title != null || v.Organized))
+        throw new Exception("Batch did not clear every selected video.");
+    if (await db.Videos.Where(v => v.Id == untouched).Select(v => v.Title).SingleAsync() != "unselected")
+        throw new Exception("Batch modified an unselected video.");
+    foreach (var selected in new[] { first, last })
+        if (!(await File.ReadAllBytesAsync(thumbnails.GetThumbnailPathForVideo(selected))).SequenceEqual(expectedCover))
+            throw new Exception("Successful batch item default cover was not restored.");
+    var successProgress = new TestProgress();
+    await ClearAllMetadataExtension.RunBatchAsync(scopes, CovePrincipal.System(), [first, last], successProgress, CancellationToken.None);
+    if (successProgress.Units.Count != 2 || successProgress.Units.Any(u => u.Outcome != JobUnitOutcome.Succeeded) || successProgress.Summary != "2 videos cleared with default covers regenerated; 0 failed.")
+        throw new Exception("All-success batch did not complete correctly.");
+    try
+    {
+        await ClearAllMetadataExtension.RunBatchAsync(scopes, CovePrincipal.System(), [untouched], new TestProgress(), new CancellationToken(true));
+        throw new Exception("Cancelled batch should not run.");
+    }
+    catch (OperationCanceledException) { }
+    var denied = new TestProgress();
+    try
+    {
+        await ClearAllMetadataExtension.RunBatchAsync(scopes, CovePrincipal.Anonymous(), [untouched], denied, CancellationToken.None);
+        throw new Exception("Unauthorized batch should fail.");
+    }
+    catch (InvalidOperationException ex) when (ex.Message.Contains("1 videos failed")) { }
+    if (await db.Videos.Where(v => v.Id == untouched).Select(v => v.Title).SingleAsync() != "unselected")
+        throw new Exception("Cancelled or unauthorized batch modified video.");
+    Console.WriteLine("PASS: bulk deduplication, mixed success/failure continuation, per-video units, summary, default covers, unselected preservation, cancellation, authorization.");
 }
 
 sealed class TestBlobService : IBlobService
@@ -152,10 +219,28 @@ sealed class TestBlobService : IBlobService
     public Task DeleteBlobAsync(string blobId, CancellationToken ct = default) { Deleted.Add(blobId); return Task.CompletedTask; }
 }
 
-sealed class TestProgress : IJobProgress
+sealed class TestProgress : HostProgress
 {
     public bool Completed { get; private set; }
+    public string? Summary { get; private set; }
+    public List<TestUnit> Units { get; } = [];
     public void Report(double progress, string? subTask = null) { Completed = progress == 1; }
+    public void SetSummary(string summary) { Summary = summary; Completed = true; }
+    public HostUnit StartUnit(string id, string? label = null) { var unit = new TestUnit(); Units.Add(unit); return unit; }
+}
+
+sealed class TestUnit : HostUnit
+{
+    public JobUnitOutcome? Outcome { get; private set; }
+    public void Report(double progress, string? message = null) { }
+    public void Complete(JobUnitOutcome outcome, string? message = null) => Outcome = outcome;
+    public void Dispose() { }
+}
+
+sealed class TestScopeFactory(IServiceScopeFactory factory) : IExtensionServiceScopeFactory
+{
+    public IServiceScope CreateScope() => factory.CreateScope();
+    public AsyncServiceScope CreateAsyncScope() => factory.CreateAsyncScope();
 }
 
 public class UnusedDependency : DispatchProxy
