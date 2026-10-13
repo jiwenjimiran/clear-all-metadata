@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import bundle, { clearMetadata, placeMenuAction, ClearMetadataSettings } from '../frontend/index.mjs';
-import { defaults } from '../frontend/options.mjs';
+import { defaults, normalizedSettings, selectedLabels, keptLabels } from '../frontend/options.mjs';
 import { createElement } from 'react';
 import { createRoot } from 'react-dom/client';
 
@@ -86,6 +86,7 @@ test('bulk action sits immediately left of Delete with eraser icon and preserves
   assert.equal(button.querySelectorAll('svg path').length, 3);
   assert.equal(button.querySelector('svg').getAttribute('viewBox'), '0 0 24 24');
   assert.equal(button.querySelector('svg').style.color, 'rgb(248, 113, 113)');
+  assert.equal(button.style.color, 'rgb(248, 113, 113)');
   placeMenuAction(doc);
   button.querySelector('svg').classList.add('animate-spin');
   button.querySelector('svg').innerHTML = '<circle cx="12" cy="12" r="10"></circle>';
@@ -138,11 +139,59 @@ test('settings default assets to kept and save individual wipe choices', async (
   };
   const container = document.createElement('div'); document.body.appendChild(container);
   const root = createRoot(container); root.render(createElement(ClearMetadataSettings));
-  await until(() => document.querySelectorAll('input').length === 17);
-  const checks = [...document.querySelectorAll('input')];
-  assert.equal(checks.slice(12).some(input => input.checked), false);
-  checks[14].click(); button('Save settings').click();
+  await until(() => document.querySelectorAll('input').length === 18);
+  const check = text => [...document.querySelectorAll('label')].find(label => label.textContent === text).querySelector('input');
+  assert.equal(check('Also clear AI tags').checked, false);
+  assert.equal(check('pHash fingerprints').checked, false);
+  check('pHash fingerprints').click(); button('Save settings').click();
   await until(() => document.querySelector('[role=status]'));
   assert.equal(saved.phash, true); assert.equal(saved.thumbnails, false); assert.equal(saved.md5, false);
   root.unmount(); dom.window.close();
+});
+
+test('AI subsetting defaults off for existing settings and is gated by Tags', async () => {
+  assert.equal(normalizedSettings({ tags: true }).alsoClearAiTags, false);
+  assert.ok(selectedLabels(defaults).includes('Non-AI tags'));
+  assert.ok(keptLabels(defaults).includes('AI tags added by AI Tagging'));
+  assert.ok(selectedLabels({ ...defaults, alsoClearAiTags: true }).includes('Tags (including AI tags)'));
+  assert.ok(!keptLabels({ ...defaults, alsoClearAiTags: true }).includes('AI tags added by AI Tagging'));
+  assert.ok(!selectedLabels({ ...defaults, tags: false, alsoClearAiTags: true }).some(label => label.includes('tags')));
+  const dom = setup(); let saved;
+  globalThis.fetch = async (_url, options) => {
+    if (options.method === 'PUT') saved = JSON.parse(options.body);
+    return { ok: true, json: async () => saved || { tags: true } };
+  };
+  const root = createRoot(document.body.appendChild(document.createElement('div'))); root.render(createElement(ClearMetadataSettings));
+  await until(() => document.querySelectorAll('input').length === 18);
+  const check = text => [...document.querySelectorAll('label')].find(label => label.textContent === text).querySelector('input');
+  assert.equal(check('Also clear AI tags').checked, false);
+  assert.ok(check('Also clear AI tags').closest('.clear-subsetting'));
+  check('Also clear AI tags').click(); check('Tags').click();
+  await until(() => check('Also clear AI tags').disabled);
+  assert.equal(check('Also clear AI tags').checked, true);
+  button('Save settings').click(); await until(() => saved);
+  assert.equal(saved.tags, false); assert.equal(saved.alsoClearAiTags, true);
+  root.unmount(); dom.window.close();
+});
+
+test('confirmation states whether AI tags are preserved and snapshots the override', async () => {
+  const dom = setup(); let payload;
+  let settings = { ...defaults };
+  globalThis.fetch = async (url, options) => {
+    if (url.endsWith('/settings')) return { ok: true, json: async () => settings };
+    payload = JSON.parse(options.body); return { ok: true, json: async () => ({ jobId: 'ai-clear' }) };
+  };
+  let result = clearMetadata(null, { entityIds: [42] });
+  await until(() => button('Queue clearing') && !button('Queue clearing').disabled);
+  assert.match(document.querySelector('[role=dialog] ul').textContent, /Non-AI tags/);
+  assert.match(document.querySelector('[role=dialog]').textContent, /AI tags added by AI Tagging/);
+  button('Cancel').click(); await result;
+  settings = { ...defaults, alsoClearAiTags: true };
+  result = clearMetadata(null, { entityIds: [42] });
+  await until(() => button('Queue clearing') && !button('Queue clearing').disabled);
+  assert.match(document.querySelector('[role=dialog] ul').textContent, /Tags \(including AI tags\)/);
+  assert.doesNotMatch(document.querySelector('[role=dialog]').textContent, /AI tags added by AI Tagging/);
+  button('Queue clearing').click(); await result;
+  assert.equal(payload.settings.alsoClearAiTags, true);
+  dom.window.close();
 });

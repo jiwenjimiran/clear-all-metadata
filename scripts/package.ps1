@@ -28,6 +28,15 @@ try {
     }
 } finally { $archive.Dispose() }
 try { [IO.File]::WriteAllBytes($zip, $stream.ToArray()) } finally { $stream.Dispose() }
-Get-FileHash -LiteralPath $zip -Algorithm SHA256
+$check = [IO.Compression.ZipFile]::OpenRead($zip)
+try {
+    foreach ($required in @('extension.json', 'Cove.ClearAllMetadata.dll', 'Cove.ClearAllMetadata.deps.json', 'Cove.ClearAllMetadata.runtimeconfig.json', 'assets/index.mjs', 'assets/options.mjs', 'assets/styles.css')) {
+        if ($check.Entries.FullName -notcontains $required) { throw "ZIP is missing $required" }
+    }
+    if ($check.Entries.FullName -contains 'Cove.Data.dll' -or $check.Entries.FullName -contains 'Cove.Sdk.dll') { throw 'ZIP must not bundle host assemblies.' }
+} finally { $check.Dispose() }
+$hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+[IO.File]::WriteAllText("$zip.sha256", "$hash  $([IO.Path]::GetFileName($zip))`n")
+Write-Output "SHA256: $hash"
 Write-Output "Package: $zip"
 

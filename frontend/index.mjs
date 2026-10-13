@@ -1,7 +1,7 @@
 import { extensionFetch } from '@cove/runtime/api';
 import { createElement as h, useState, useEffect, useRef } from '@cove/runtime/react';
 import { createRoot } from '@cove/runtime/react-dom-client';
-import { metadataFields, assetFields, normalizedSettings, selectedLabels } from './options.mjs';
+import { metadataFields, assetFields, normalizedSettings, selectedLabels, keptLabels } from './options.mjs';
 
 async function api(path, options = {}) {
   const response = await extensionFetch('/api/ext/clear-all-metadata' + path, {
@@ -30,11 +30,16 @@ export function ClearMetadataSettings() {
     finally { setBusy(false); }
   }
   const group = (label, fields) => h('fieldset', null, h('legend', null, label), ...fields.map(([key, title]) =>
-    h('label', { key, className: 'clear-option' }, h('input', { type: 'checkbox', checked: settings[key], disabled: busy,
-      onChange: e => { setSettings({ ...settings, [key]: e.target.checked }); setMessage(''); } }), title)));
+    h('div', { key }, h('label', { className: 'clear-option' }, h('input', { type: 'checkbox', checked: settings[key], disabled: busy,
+      onChange: e => { setSettings({ ...settings, [key]: e.target.checked }); setMessage(''); } }), title),
+      key === 'tags' && h('div', { className: 'clear-subsetting' }, h('label', { className: 'clear-option' },
+        h('input', { type: 'checkbox', checked: settings.alsoClearAiTags, disabled: busy || !settings.tags,
+          onChange: e => { setSettings({ ...settings, alsoClearAiTags: e.target.checked }); setMessage(''); } }), 'Also clear AI tags'),
+        h('small', null, 'Off by default. Keep tags with recorded AI Tagging provenance; matching a model tag name alone does not protect a tag.')))));
   return h('section', { className: 'clear-metadata-ui' }, h('h2', null, 'Clear all metadata'),
     h('p', null, 'Checked items will be cleared. Unchecked items will be kept. These defaults apply to single-video and bulk actions.'),
     h('p', null, 'Thumbnails, sprite sheets, pHash, video previews, and MD5 checksums are kept by default. Original media files are always kept.'),
+    h('p', null, 'AI Tagging tags are kept by default. Enable Also clear AI tags under Tags to remove them too.'),
     error && h('p', { role: 'alert' }, error),
     settings ? h('form', { onSubmit: save }, group('Descriptive metadata', metadataFields), group('Generated assets and fingerprints', assetFields),
       h('button', { type: 'submit', disabled: busy }, busy ? 'Saving…' : 'Save settings'), message && h('p', { role: 'status' }, message)) : h('p', null, 'Loading settings…'));
@@ -71,7 +76,7 @@ function ConfirmClear({ ids, finish }) {
     }
   }
   const clear = settings ? selectedLabels(settings) : [];
-  const keep = settings ? selectedLabels(Object.fromEntries(Object.entries(settings).map(([key, value]) => [key, !value]))) : [];
+  const keep = settings ? keptLabels(settings) : [];
   return h('div', { className: 'clear-backdrop' }, h('section', { className: 'clear-metadata-ui clear-dialog', role: 'dialog', 'aria-modal': true,
     'aria-labelledby': 'clear-confirm-title', ref: dialog, onKeyDown: keyboard },
     h('h2', { id: 'clear-confirm-title' }, 'Clear selected metadata?'),
@@ -114,6 +119,7 @@ export async function clearMetadata(_action, payload) {
 export function placeMenuAction(doc = document) {
   for (const button of doc.querySelectorAll('button')) {
     if (button.textContent.trim() !== 'Clear all metadata') continue;
+    button.style.color = '#f87171';
     const parent = button.parentElement;
     const deleteButton = [...parent.children].find(el => el.tagName === 'BUTTON' && el.textContent.trim() === 'Delete');
     if (deleteButton && button.nextElementSibling !== deleteButton) parent.insertBefore(button, deleteButton);

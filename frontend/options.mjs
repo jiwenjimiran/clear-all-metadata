@@ -8,6 +8,14 @@ export const assetFields = [
   ['spriteSheets', 'Sprite sheets and VTT indexes'], ['phash', 'pHash fingerprints'],
   ['videoPreviews', 'Video previews (including VR and segment previews)'], ['md5', 'MD5 checksums'],
 ];
-export const defaults = Object.fromEntries([...metadataFields.map(([key]) => [key, true]), ...assetFields.map(([key]) => [key, false])]);
+export const defaults = Object.fromEntries([...metadataFields.map(([key]) => [key, true]), ...assetFields.map(([key]) => [key, false]), ['alsoClearAiTags', false]]);
 export function normalizedSettings(value) { return Object.fromEntries(Object.entries(defaults).map(([key, fallback]) => [key, typeof value?.[key] === 'boolean' ? value[key] : fallback])); }
-export function selectedLabels(settings) { return [...metadataFields, ...assetFields].filter(([key]) => settings[key]).map(([, label]) => label); }
+export function selectedLabels(settings) {
+  return [...metadataFields, ...assetFields].filter(([key]) => settings[key]).map(([key, label]) => key === 'tags'
+    ? settings.alsoClearAiTags ? 'Tags (including AI tags)' : 'Non-AI tags' : label);
+}
+export function keptLabels(settings) {
+  const kept = [...metadataFields, ...assetFields].filter(([key]) => !settings[key]).map(([key, label]) => key === 'tags' ? 'Tags (including AI tags)' : label);
+  if (settings.tags && !settings.alsoClearAiTags) kept.push('AI tags added by AI Tagging');
+  return kept;
+}

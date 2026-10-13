@@ -10,6 +10,7 @@ public sealed record ClearSettings
     public bool Studio { get; init; } = true;
     public bool Performers { get; init; } = true;
     public bool Tags { get; init; } = true;
+    public bool AlsoClearAiTags { get; init; }
     public bool Urls { get; init; } = true;
     public bool RemoteIds { get; init; } = true;
     public bool Cover { get; init; } = true;

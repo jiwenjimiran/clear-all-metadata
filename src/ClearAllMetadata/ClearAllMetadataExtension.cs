@@ -30,7 +30,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
     }
     public string Id => "cove.community.clear-all-metadata";
     public string Name => "clear-all-metadata";
-    public string Version => "0.1.4";
+    public string Version => "0.1.5";
     public string? Description => "Clear video identification metadata without rescanning.";
     public string? Author => "jiwenji";
     public string? Url => "https://github.com/jiwenjimiran/clear-all-metadata";
@@ -202,12 +202,17 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
                 .FirstOrDefaultAsync(v => v.Id == id, ct);
             if (video is null) return false;
             settings ??= new();
-            Reset(video, settings);
-            if (settings.Tags) db.TagApplications.RemoveRange(await db.TagApplications
-                .Where(p => p.HostType == AffinityHostType.Video && p.HostId == id).ToListAsync(ct));
+            var applications = settings.Tags ? await db.TagApplications
+                .Where(p => p.HostType == AffinityHostType.Video && p.HostId == id).ToListAsync(ct) : [];
+            var keptTagIds = settings.AlsoClearAiTags ? new HashSet<int>() : applications
+                .Where(p => IsAiTaggingSource(p.SourceKey)).Select(p => p.TagId).ToHashSet();
+            Reset(video, settings, keptTagIds);
+            if (settings.Tags) db.TagApplications.RemoveRange(applications
+                .Where(p => settings.AlsoClearAiTags || !IsAiTaggingSource(p.SourceKey)));
             var keys = settings.ProvenanceKeys();
             db.FieldProvenance.RemoveRange(await db.FieldProvenance
-                .Where(p => p.HostType == AffinityHostType.Video && p.HostId == id && keys.Contains(p.FieldKey)).ToListAsync(ct));
+                .Where(p => p.HostType == AffinityHostType.Video && p.HostId == id && keys.Contains(p.FieldKey)
+                    && (p.FieldKey != "tags" || settings.AlsoClearAiTags || p.SourceKey != AiTaggingSource)).ToListAsync(ct));
             if (settings.Phash || settings.Md5)
             {
                 var fileIds = db.VideoFiles.Where(f => f.VideoId == id).Select(f => f.Id);
@@ -220,7 +225,10 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
             return true;
         });
 
-    public static void Reset(Video video, ClearSettings? settings = null)
+    public const string AiTaggingSource = "ext:ai.tagging";
+    public static bool IsAiTaggingSource(string sourceKey) => sourceKey == AiTaggingSource;
+
+    public static void Reset(Video video, ClearSettings? settings = null, IReadOnlySet<int>? keptTagIds = null)
     {
         settings ??= new();
         if (settings.Title) video.Title = null;
@@ -233,7 +241,8 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
         if (settings.Organized) video.Organized = false;
         if (settings.Urls) video.Urls.Clear();
         if (settings.RemoteIds) video.RemoteIds.Clear();
-        if (settings.Tags) video.VideoTags.Clear();
+        if (settings.Tags) foreach (var link in video.VideoTags
+            .Where(link => settings.AlsoClearAiTags || keptTagIds?.Contains(link.TagId) != true).ToArray()) video.VideoTags.Remove(link);
         if (settings.Performers) video.VideoPerformers.Clear();
         video.UpdatedAt = DateTime.UtcNow;
     }

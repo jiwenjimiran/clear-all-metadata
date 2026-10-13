@@ -17,12 +17,25 @@ using HostUnit = Cove.Core.Interfaces.IJobUnit;
 
 void Check(bool condition, string message) { if (!condition) throw new Exception(message); }
 var defaults = new ClearSettings();
+Check(!defaults.AlsoClearAiTags, "AI tags must be kept by default.");
 Check(!defaults.Thumbnails && !defaults.SpriteSheets && !defaults.Phash && !defaults.VideoPreviews && !defaults.Md5, "Generated data must be kept by default.");
 var metadataExtension = new ClearAllMetadataExtension();
 var store = new TestStore(); metadataExtension.SetStore(store);
 Check(await metadataExtension.SettingsAsync() == defaults, "Fresh install defaults incorrect.");
 await store.SetAsync("settings", "{\"title\":false,\"md5\":true}");
 Check(!(await metadataExtension.SettingsAsync()).Title && (await metadataExtension.SettingsAsync()).Md5 && !(await metadataExtension.SettingsAsync()).Thumbnails, "Saved settings did not survive load.");
+Check(!(await metadataExtension.SettingsAsync()).AlsoClearAiTags, "Existing settings must preserve AI tags after upgrade.");
+await store.SetAsync("settings", "{\"tags\":true,\"alsoClearAiTags\":true}");
+Check((await metadataExtension.SettingsAsync()).AlsoClearAiTags, "AI wipe override must survive settings persistence.");
+Check(ClearAllMetadataExtension.IsAiTaggingSource("ext:ai.tagging") && !ClearAllMetadataExtension.IsAiTaggingSource("scraper:local")
+    && !ClearAllMetadataExtension.IsAiTaggingSource("ext:ai.other") && !ClearAllMetadataExtension.IsAiTaggingSource("ext:ai.tagging-fake"), "Only exact AI Tagging provenance protects a tag.");
+var resetFixture = new Video { VideoTags = [new() { TagId = 1 }, new() { TagId = 2 }] };
+ClearAllMetadataExtension.Reset(resetFixture, defaults, new HashSet<int> { 1 });
+Check(resetFixture.VideoTags.Single().TagId == 1, "Reset must keep AI-backed tag links.");
+ClearAllMetadataExtension.Reset(resetFixture, defaults with { Tags = false, AlsoClearAiTags = true });
+Check(resetFixture.VideoTags.Count == 1, "Tags parent must gate AI tag clearing.");
+ClearAllMetadataExtension.Reset(resetFixture, defaults with { AlsoClearAiTags = true }, new HashSet<int> { 1 });
+Check(resetFixture.VideoTags.Count == 0, "Explicit override must clear AI tag links.");
 Check(metadataExtension.GetUIManifest().SettingsPanels.Count == 1 && metadataExtension.GetUIManifest().Actions.Count == 2, "Missing settings or actions.");
 Check(ClearAllMetadataExtension.SelectionIds([1, 2, 1]).SequenceEqual(new[] { 1, 2 }), "IDs not deduplicated.");
 Console.WriteLine("PASS: settings defaults, persistence, UI declarations, selection deduplication.");
@@ -87,6 +100,59 @@ Check(cleared.Files.Single().Fingerprints.Count == 3 && cleared.Files.Single().D
 Check(await File.ReadAllTextAsync(cleared.Files.Single().Path) == "original-media", "Source media changed.");
 Check(!await db.TagApplications.AnyAsync(p => p.HostId == first) && !await db.FieldProvenance.AnyAsync(p => p.HostId == first), "Selected provenance remains.");
 Console.WriteLine("PASS: default reset preserves every generated asset and hash, including with an undecodable source; no generation is run.");
+
+async Task<(int Id, int Boobs, int Custom)> SeedAiTags(string label)
+{
+    var id = await Seed(label);
+    var names = new[] { "Boobs", "Pussy", "Tongue", "Chastity", "69", "Custom AI tag outside model lists", "Untrusted AI source" };
+    var tags = new List<Tag>();
+    foreach (var name in names) {
+        var tag = await db.Tags.SingleOrDefaultAsync(t => t.Name == name);
+        if (tag is null) { tag = new Tag { Name = name }; db.Tags.Add(tag); }
+        tags.Add(tag);
+    }
+    await db.SaveChangesAsync();
+    var video = await db.Videos.Include(v => v.VideoTags).SingleAsync(v => v.Id == id);
+    foreach (var tag in tags) video.VideoTags.Add(new VideoTag { VideoId = id, TagId = tag.Id });
+    for (var index = 0; index < tags.Count; index++) db.TagApplications.Add(new TagApplication {
+        HostType = AffinityHostType.Video, HostId = id, TagId = tags[index].Id,
+        SourceKey = index is 0 or 5 ? "ext:ai.tagging" : index == 2 ? "user" : index == 6 ? "ext:ai.other" : "scraper:local",
+        ModelKey = index is 0 or 5 ? "bodyparts" : "", SourceRunId = index is 0 or 5 ? "recorded-by-ai-tagging" : ""
+    });
+    // The same visible tag has both AI and scraped evidence: only the scraped evidence should be wiped.
+    db.TagApplications.Add(new TagApplication { HostType = AffinityHostType.Video, HostId = id, TagId = tags[0].Id, SourceKey = "scraper:local" });
+    db.FieldProvenance.AddRange(new FieldProvenance { HostType = AffinityHostType.Video, HostId = id, FieldKey = "tags", SourceKey = "ext:ai.tagging", ValueJson = "[" + tags[0].Id + "]" },
+        new FieldProvenance { HostType = AffinityHostType.Video, HostId = id, FieldKey = "tags", SourceKey = "scraper:local", ValueJson = "[" + tags[1].Id + "]" });
+    await db.SaveChangesAsync();
+    return (id, tags[0].Id, tags[5].Id);
+}
+var aiDefault = await SeedAiTags("ai-default");
+var unselectedAi = await SeedAiTags("ai-unselected");
+await Run(aiDefault.Id);
+var aiKept = await Reload(aiDefault.Id);
+Check(aiKept.VideoTags.Select(t => t.TagId).Order().SequenceEqual(new[] { aiDefault.Boobs, aiDefault.Custom }.Order()), "Default must keep only AI-backed tag links, including custom names.");
+var aiApplications = await db.TagApplications.Where(p => p.HostType == AffinityHostType.Video && p.HostId == aiDefault.Id).ToListAsync();
+Check(aiApplications.Count == 2 && aiApplications.All(p => p.SourceKey == "ext:ai.tagging" && p.SourceRunId == "recorded-by-ai-tagging" && p.ModelKey == "bodyparts"), "AI applications and exact model/run provenance must survive; mixed scraper evidence must be removed.");
+Check(await db.FieldProvenance.CountAsync(p => p.HostType == AffinityHostType.Video && p.HostId == aiDefault.Id) == 1
+    && await db.FieldProvenance.AnyAsync(p => p.HostId == aiDefault.Id && p.FieldKey == "tags" && p.SourceKey == "ext:ai.tagging"), "Only AI tag field provenance should remain.");
+Check((await Reload(unselectedAi.Id)).VideoTags.Count == 8, "Unselected video's tag links must remain untouched.");
+var scrapedOnly = await Seed("scraped-boobs-only");
+var scrapedVideo = await db.Videos.Include(v => v.VideoTags).SingleAsync(v => v.Id == scrapedOnly);
+scrapedVideo.VideoTags.Add(new VideoTag { VideoId = scrapedOnly, TagId = aiDefault.Boobs });
+db.TagApplications.Add(new TagApplication { HostType = AffinityHostType.Video, HostId = scrapedOnly, TagId = aiDefault.Boobs,
+    SourceKey = "scraper:local", ModelKey = "bodyparts" });
+await db.SaveChangesAsync(); await Run(scrapedOnly);
+Check((await Reload(scrapedOnly)).VideoTags.Count == 0 && !await db.TagApplications.AnyAsync(p => p.HostId == scrapedOnly),
+    "Scraped-only Boobs must clear despite its model name/key and AI evidence on another video.");
+var allTags = await SeedAiTags("ai-clear-all");
+await Run(allTags.Id, defaults with { AlsoClearAiTags = true });
+Check((await Reload(allTags.Id)).VideoTags.Count == 0 && !await db.TagApplications.AnyAsync(p => p.HostId == allTags.Id)
+    && !await db.FieldProvenance.AnyAsync(p => p.HostId == allTags.Id), "Explicit AI override must wipe all tag links and provenance.");
+var tagsOff = await SeedAiTags("ai-tags-off");
+await Run(tagsOff.Id, defaults with { Tags = false, AlsoClearAiTags = true });
+Check((await Reload(tagsOff.Id)).VideoTags.Count == 8 && await db.TagApplications.CountAsync(p => p.HostId == tagsOff.Id) == 9
+    && await db.FieldProvenance.CountAsync(p => p.HostId == tagsOff.Id && p.FieldKey == "tags") == 2, "Unchecked Tags must preserve every tag source despite enabled child setting.");
+Console.WriteLine("PASS: exact AI Tagging provenance, custom AI names, scraped/manual model names, mixed sources, preserved run/model/field evidence, opt-in AI wipe, parent gating and unselected isolation.");
 
 var selective = await Seed("selective");
 await Run(selective, defaults with { Title = false, Date = false, Tags = false, Cover = false, Md5 = true, SpriteSheets = true });
