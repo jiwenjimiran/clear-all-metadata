@@ -30,7 +30,7 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
     }
     public string Id => "cove.community.clear-all-metadata";
     public string Name => "clear-all-metadata";
-    public string Version => "0.1.5";
+    public string Version => "0.1.6";
     public string? Description => "Clear video identification metadata without rescanning.";
     public string? Author => "jiwenji";
     public string? Url => "https://github.com/jiwenjimiran/clear-all-metadata";
@@ -38,7 +38,10 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
     public string? MinCoveVersion => "1.5.1";
     public IReadOnlyList<string> Categories => ["video", "tools"];
     public void ConfigureServices(IServiceCollection services, ExtensionContext context)
-        => services.AddScoped<IGeneratedAssetCleaner, GeneratedAssetCleaner>();
+    {
+        services.AddScoped<IGeneratedAssetCleaner, GeneratedAssetCleaner>();
+        services.AddScoped<IDefaultCoverResetter, DefaultCoverResetter>();
+    }
     public Task InitializeAsync(IServiceProvider services, CancellationToken ct = default)
     {
         _scopes = services.GetRequiredService<IExtensionServiceScopeFactory>();
@@ -171,6 +174,18 @@ public sealed class ClearAllMetadataExtension : IExtension, IUIExtension, IApiEx
             {
                 progress.Report(0.5, "Clearing selected generated assets");
                 await services.GetRequiredService<IGeneratedAssetCleaner>().ClearAsync(id, settings, ct);
+                if (settings.Cover && !settings.Thumbnails)
+                {
+                    progress.Report(0.75, "Restoring default frame cover");
+                    await services.GetRequiredService<IDefaultCoverResetter>().ResetAsync(id, ct);
+                    // Change the media URL only after the replacement is ready,
+                    // avoiding a cached response for the pre-regeneration file.
+                    var db = services.GetRequiredService<CoveContext>();
+                    db.ChangeTracker.Clear();
+                    var video = await db.Videos.SingleAsync(v => v.Id == id, ct);
+                    video.UpdatedAt = DateTime.UtcNow;
+                    await db.SaveChangesAsync(ct);
+                }
                 progress.SetSummary($"Selected fields cleared for video #{id}.");
             }
             finally

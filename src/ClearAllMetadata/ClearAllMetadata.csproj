@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <EnableDynamicLoading>true</EnableDynamicLoading>
-    <Version>0.1.5</Version>
+    <Version>0.1.6</Version>
     <CoveSourceRoot Condition="'$(CoveSourceRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\cove</CoveSourceRoot>
   </PropertyGroup>
   <ItemGroup>

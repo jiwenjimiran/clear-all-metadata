@@ -6,7 +6,9 @@ Open a video's triple-dot **Operations** menu and choose **Clear all metadata**,
 
 For multiple videos, select them in a video list and use **Clear all metadata** on the selection actions bar, immediately left of **Delete**. Both actions use red text, a red eraser icon, and the same confirmation modal. One queued job processes the selection sequentially, with a result for each video. A failed video does not prevent the remaining selected videos from being processed. Successful resets are retained; the job reports any failures. Duplicate IDs are processed once, and up to 10,000 videos can be selected.
 
-In **Settings → Extensions → Clear all metadata**, select what gets wiped. Each descriptive field can be turned on or off. Thumbnails, sprite sheets, pHash fingerprints, video previews, and MD5 checksums are **off by default**, so they are preserved. Clearing explicit cover art reveals the existing generated cover without regenerating it. The action no longer runs FFmpeg or requires a readable source video to clear descriptive metadata. The job uses a snapshot of the choices shown in its confirmation modal.
+In **Settings → Extensions → Clear all metadata**, select what gets wiped. Each descriptive field can be turned on or off. **Cover image (restore default frame)** is on by default: it removes scraped/explicit artwork and regenerates only the primary cover at Generate's default frame position. This replaces a stale generated cover as well as clearing the scraped-cover reference, then refreshes the media URL after the replacement is ready. Other thumbnails and VR cards, sprite sheets, pHash fingerprints, video previews, and MD5 checksums are preserved by default. The job uses a snapshot of the choices shown in its confirmation modal.
+
+Leave **Thumbnails** unchecked to retain other generated frames. Enabling it explicitly deletes all thumbnails, including the primary cover and VR cards; when enabled, cover regeneration is skipped so the requested wipe stays applied. Cover restoration needs readable primary media and FFmpeg. Failure is reported in Jobs; already-cleared metadata remains cleared. Unchecking **Cover image** keeps explicit artwork and avoids cover generation.
 
 Optional thumbnail wiping removes the generated cover, timestamped thumbnails, and VR cards. Sprite wiping removes the sprite image and VTT index. Preview wiping removes regular, VR, and segment previews. Hash wiping removes only the selected hash type from the selected videos' files; other fingerprints such as oshash are retained. Generated files are removed under Cove's per-video generation lock. Filesystem changes follow the metadata commit, so a file-removal failure is reported in Jobs while committed metadata changes remain applied. To recreate cleared generated assets, run Generate separately.
 
@@ -20,6 +22,7 @@ Requires Cove 1.5.1+, video read/write permission, and jobs.run permission. Savi
 
 Version 0.1.4 adds configurable wipes, preservation of generated assets and hashes by default, a confirmation modal, and a red eraser icon. It replaces the automatic cover regeneration from 0.1.2–0.1.3. Version 0.1.3 added bulk clearing. Version 0.1.1 fixed the original transaction errors.
 Version 0.1.5 preserves AI Tagging tags by default, adds the opt-in **Also clear AI tags** subsetting, and colors the action text red.
+Version 0.1.6 resets the displayed primary cover to the default frame, replacing stale generated-cover caches while retaining other generated assets and hashes by default.
 
 ## Install
 
@@ -42,9 +45,10 @@ npm ci
 npm test
 dotnet run --project tests/Backend/Backend.csproj -c Release -p:CoveCiVersion=true
 # Use a fresh disposable test database, never a library database:
-dotnet run --project tests/Backend/Backend.csproj -c Release -p:CoveCiVersion=true -- 'Host=127.0.0.1;Port=55441;Username=postgres;Database=clear_metadata_regression'
+ffmpeg -v error -y -f lavfi -i 'testsrc2=size=600x828:rate=29.97:duration=5.37' -c:v libx264 -pix_fmt yuv420p artifacts/cover-fixture-short.mp4
+dotnet run --project tests/Backend/Backend.csproj -c Release -p:CoveCiVersion=true -- 'Host=127.0.0.1;Port=55441;Username=postgres;Database=clear_metadata_regression' (Get-Command ffmpeg).Source artifacts/cover-fixture-short.mp4
 ```
 
-The PostgreSQL integration check enables Cove's actual retry strategy and save interceptors. It verifies default asset/hash preservation, isolated optional wipes using the real host generated-path service, selective provenance removal, settings persistence, bulk continuation, cancellation, and permissions. No FFmpeg is needed. PostgreSQL must have pgvector available. Frontend tests cover modal confirmation/cancellation, exact saved settings, inline errors, settings persistence requests, and red icon placement.
+The PostgreSQL integration check enables Cove's actual retry strategy and save interceptors. It verifies served cover restoration using the real host thumbnail/stream services and FFmpeg, other asset/hash preservation, isolated optional wipes, AI tag preservation, selective provenance removal, settings persistence, bulk continuation, cancellation, and permissions. PostgreSQL must have pgvector available. Frontend tests cover modal confirmation/cancellation, exact saved settings, inline errors, settings persistence requests, and red icon placement.
 
 Menu and actions-bar placement use a scoped DOM reorder because Cove's current action API has no section placement option. The same hook replaces Cove's generic extension icon with eraser paths, preserving the loading spinner while the action is queueing. If a future UI changes the Delete label or markup, the action remains available in Cove's regular extension action slot.

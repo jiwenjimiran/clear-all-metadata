@@ -38,7 +38,7 @@ export function ClearMetadataSettings() {
         h('small', null, 'Off by default. Keep tags with recorded AI Tagging provenance; matching a model tag name alone does not protect a tag.')))));
   return h('section', { className: 'clear-metadata-ui' }, h('h2', null, 'Clear all metadata'),
     h('p', null, 'Checked items will be cleared. Unchecked items will be kept. These defaults apply to single-video and bulk actions.'),
-    h('p', null, 'Thumbnails, sprite sheets, pHash, video previews, and MD5 checksums are kept by default. Original media files are always kept.'),
+    h('p', null, 'Cover image resets the displayed cover to a default video frame. Other thumbnails, sprite sheets, pHash, video previews, and MD5 checksums are kept by default. Original media files are always kept.'),
     h('p', null, 'AI Tagging tags are kept by default. Enable Also clear AI tags under Tags to remove them too.'),
     error && h('p', { role: 'alert' }, error),
     settings ? h('form', { onSubmit: save }, group('Descriptive metadata', metadataFields), group('Generated assets and fingerprints', assetFields),

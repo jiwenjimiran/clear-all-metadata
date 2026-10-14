@@ -40,6 +40,7 @@ Check(metadataExtension.GetUIManifest().SettingsPanels.Count == 1 && metadataExt
 Check(ClearAllMetadataExtension.SelectionIds([1, 2, 1]).SequenceEqual(new[] { 1, 2 }), "IDs not deduplicated.");
 Console.WriteLine("PASS: settings defaults, persistence, UI declarations, selection deduplication.");
 if (args.Length == 0) return;
+if (args.Length < 3) throw new ArgumentException("Provide the PostgreSQL connection, FFmpeg executable, and a 5.37-second source fixture.");
 
 var generated = Path.GetFullPath(Path.Combine("artifacts", "settings-regression-" + Guid.NewGuid().ToString("N")));
 Directory.CreateDirectory(generated);
@@ -49,10 +50,11 @@ services.AddCoveData(args[0], runBackgroundMaterializers: false);
 services.AddSingleton<IBlobService, TestBlobService>();
 services.AddSingleton<VideoGeneratedAssetCoordinator>();
 services.AddSingleton<IThumbnailService>(sp => new ThumbnailService(sp.GetRequiredService<IServiceScopeFactory>(),
-    DispatchProxy.Create<IJobService, UnusedDependency>(), new CoveConfiguration { GeneratedPath = generated },
+    DispatchProxy.Create<IJobService, UnusedDependency>(), new CoveConfiguration { GeneratedPath = generated, FfmpegPath = args[1] },
     DispatchProxy.Create<IZipFileReader, UnusedDependency>(), sp.GetRequiredService<IBlobService>(), NullLogger<ThumbnailService>.Instance,
     sp.GetRequiredService<VideoGeneratedAssetCoordinator>()));
 services.AddScoped<IGeneratedAssetCleaner, GeneratedAssetCleaner>();
+services.AddScoped<IDefaultCoverResetter, DefaultCoverResetter>();
 await using var provider = services.BuildServiceProvider();
 await using var scope = provider.CreateAsyncScope();
 var db = scope.ServiceProvider.GetRequiredService<CoveContext>();
@@ -68,11 +70,11 @@ async Task<int> Seed(string label)
 {
     db.ChangeTracker.Clear();
     var folder = Path.Combine(generated, label); Directory.CreateDirectory(folder);
-    await File.WriteAllTextAsync(Path.Combine(folder, "source.mp4"), "original-media");
+    File.Copy(args[2], Path.Combine(folder, "source.mp4"));
     var video = new Video { Title = label, Details = "details", Studio = new Studio { Name = label + " studio" },
         Organized = true, ImageBlobId = label + " cover", Date = new DateOnly(2020, 1, 1),
         VideoTags = [new() { Tag = new Tag { Name = label + " tag" } }],
-        Files = [new() { Basename = "source.mp4", ParentFolder = new Folder { Path = folder.Replace('\\', '/') }, Duration = 123,
+        Files = [new() { Basename = "source.mp4", ParentFolder = new Folder { Path = folder.Replace('\\', '/') }, Duration = 5.37,
             Fingerprints = [new() { Type = "md5", Value = "md5-value" }, new() { Type = "phash", Value = "phash-value" }, new() { Type = "oshash", Value = "keep-oshash" }] }] };
     db.Videos.Add(video); await db.SaveChangesAsync();
     db.FieldProvenance.AddRange(new FieldProvenance { HostType = AffinityHostType.Video, HostId = video.Id, FieldKey = "title" },
@@ -92,14 +94,28 @@ async Task<Video> Reload(int id)
 async Task Run(int id, ClearSettings? settings = null) => await ClearAllMetadataExtension.RunJobAsync(scope.ServiceProvider, CovePrincipal.System(), id, new TestProgress(), CancellationToken.None, settings);
 
 var first = await Seed("default");
+var streams = new StreamService(provider.GetRequiredService<IServiceScopeFactory>(), thumbnails, scope.ServiceProvider.GetRequiredService<IBlobService>());
+async Task<byte[]> ServedCover(int id)
+{
+    var result = await streams.GetVideoScreenshot(id, null) ?? throw new Exception("Cover stream missing.");
+    await using var stream = result.stream;
+    using var output = new MemoryStream(); await stream.CopyToAsync(output); return output.ToArray();
+}
+Check(System.Text.Encoding.UTF8.GetString(await ServedCover(first)) == "scraped-cover", "Fixture did not serve the scraped cover before reset.");
+Check(await thumbnails.RegenerateVideoThumbnailAsync(first), "Default generation baseline failed.");
+var expectedCover = await File.ReadAllBytesAsync(thumbnails.GetThumbnailPathForVideo(first));
+await File.WriteAllTextAsync(thumbnails.GetThumbnailPathForVideo(first), "stale-incorrect-cover");
 await Run(first);
+Check((await ServedCover(first)).SequenceEqual(expectedCover), "Cover-serving path did not restore the default frame.");
 var cleared = await Reload(first);
 Check(cleared.Title == null && cleared.Details == null && cleared.StudioId == null && cleared.Date == null && cleared.ImageBlobId == null && !cleared.Organized && cleared.VideoTags.Count == 0, "Default metadata reset incomplete.");
-Check(Paths(first).All(p => File.ReadAllText(p) == "generated-asset"), "Default reset changed generated assets.");
-Check(cleared.Files.Single().Fingerprints.Count == 3 && cleared.Files.Single().Duration == 123, "Default reset changed hashes or technical metadata.");
-Check(await File.ReadAllTextAsync(cleared.Files.Single().Path) == "original-media", "Source media changed.");
+Check(Paths(first).Skip(1).All(p => File.ReadAllText(p) == "generated-asset"), "Default reset changed unrelated generated assets.");
+Check(cleared.Files.Single().Fingerprints.Count == 3 && cleared.Files.Single().Duration == 5.37, "Default reset changed hashes or technical metadata.");
+var sourceBytes = await File.ReadAllBytesAsync(cleared.Files.Single().Path);
+var fixtureBytes = await File.ReadAllBytesAsync(args[2]);
+Check(sourceBytes.SequenceEqual(fixtureBytes), "Source media changed.");
 Check(!await db.TagApplications.AnyAsync(p => p.HostId == first) && !await db.FieldProvenance.AnyAsync(p => p.HostId == first), "Selected provenance remains.");
-Console.WriteLine("PASS: default reset preserves every generated asset and hash, including with an undecodable source; no generation is run.");
+Console.WriteLine("PASS: served cover replaces stale cached artwork with the exact default frame; other thumbnails/assets/hashes and source media stay unchanged.");
 
 async Task<(int Id, int Boobs, int Custom)> SeedAiTags(string label)
 {
@@ -158,6 +174,7 @@ var selective = await Seed("selective");
 await Run(selective, defaults with { Title = false, Date = false, Tags = false, Cover = false, Md5 = true, SpriteSheets = true });
 var kept = await Reload(selective);
 Check(kept.Title == "selective" && kept.Date != null && kept.ImageBlobId != null && kept.VideoTags.Count == 1 && kept.Details == null, "Unchecked metadata fields were not kept.");
+Check(File.ReadAllText(thumbnails.GetThumbnailPathForVideo(selective)) == "generated-asset", "Disabled cover option changed the generated cover.");
 Check(await db.TagApplications.AnyAsync(p => p.HostId == selective) && await db.FieldProvenance.AnyAsync(p => p.HostId == selective && p.FieldKey == "title") && !await db.FieldProvenance.AnyAsync(p => p.HostId == selective && p.FieldKey == "details"), "Selective provenance cleanup incorrect.");
 Check(kept.Files.Single().Fingerprints.Select(f => f.Type).Order().SequenceEqual(new[] { "oshash", "phash" }), "MD5 wipe removed another hash.");
 Check(!File.Exists(thumbnails.GetSpritePath(selective)) && !File.Exists(thumbnails.GetSpriteVttPath(selective)) && File.Exists(thumbnails.GetThumbnailPathForVideo(selective)) && File.Exists(thumbnails.GetPreviewPath(selective)), "Sprite wipe removed unrelated assets.");
@@ -182,6 +199,12 @@ catch (OperationCanceledException) { }
 Check((await Reload(denied)).Title == "denied", "Denied/cancelled job changed metadata.");
 Check(scope.ServiceProvider.GetRequiredService<ICurrentPrincipalAccessor>().Current == null, "Principal leaked from job.");
 Console.WriteLine("PASS: bulk deduplication, continuation, per-video outcomes, authorization, cancellation, and principal restoration.");
+var missing = await Seed("unreadable");
+File.Delete((await Reload(missing)).Files.Single().Path);
+try { await Run(missing); throw new Exception("Unavailable media must not report successful cover restoration."); }
+catch (InvalidOperationException ex) when (ex.Message.Contains("default cover restoration failed")) { }
+Check((await Reload(missing)).ImageBlobId == null, "Failed generation restored the scraped cover reference.");
+Console.WriteLine("PASS: unavailable source reports partial cover-restoration failure; disabled cover option preserves the cover.");
 
 sealed class TestStore : IExtensionStore
 {
@@ -194,7 +217,8 @@ sealed class TestStore : IExtensionStore
 sealed class TestBlobService : IBlobService
 {
     public Task<string> StoreBlobAsync(Stream data, string contentType, CancellationToken ct = default) => throw new NotSupportedException();
-    public Task<(Stream Stream, string ContentType)?> GetBlobAsync(string blobId, CancellationToken ct = default) => throw new NotSupportedException();
+    public Task<(Stream Stream, string ContentType)?> GetBlobAsync(string blobId, CancellationToken ct = default)
+        => Task.FromResult<(Stream Stream, string ContentType)?>((new MemoryStream(System.Text.Encoding.UTF8.GetBytes("scraped-cover")), "image/jpeg"));
     public Task DeleteBlobAsync(string blobId, CancellationToken ct = default) => Task.CompletedTask;
 }
 sealed class TestProgress : HostProgress

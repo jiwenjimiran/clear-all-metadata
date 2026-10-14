@@ -13,6 +13,14 @@ function setup() {
   window.alert = () => { throw new Error('Unexpected success alert'); };
   return dom;
 }
+
+test('confirmation distinguishes restoring the primary cover from wiping all thumbnails', () => {
+  assert.ok(selectedLabels(defaults).includes('Cover image (restore default frame)'));
+  assert.ok(keptLabels(defaults).includes('Other thumbnails and VR cards'));
+  const wipe = { ...defaults, thumbnails: true };
+  assert.ok(selectedLabels(wipe).includes('Scraped / explicit cover art'));
+  assert.ok(!selectedLabels(wipe).includes('Cover image (restore default frame)'));
+});
 async function until(predicate) {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(r => setTimeout(r, 10)); }
   throw new Error('UI did not reach expected state.');
